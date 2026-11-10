@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ye Oldie Reminder</title>
 <link rel="manifest" href="manifest.json">
+<script src="config.js"></script>
 <meta name="theme-color" content="#8c3b1f">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Reminder">
@@ -82,6 +83,34 @@ audio{width:100%;margin-top:8px}
     <div class="note" id="micNote"></div>
   </div>
 
+  <div class="card" id="connectCard" hidden>
+    <h2>Share with your clinician (optional)</h2>
+    <div class="note" style="margin-bottom:6px">This app works fully on its own. Sharing only starts if you choose it, and you can stop at any time.</div>
+    <div id="connectIn">
+      <label>Code from your clinician</label>
+      <input type="text" id="codeIn" maxlength="8" autocapitalize="characters" autocomplete="off" placeholder="e.g. K7M2QX9P">
+      <button id="connectBtn" class="alt" type="button">Continue</button>
+    </div>
+    <div id="consentBox" hidden>
+      <p><strong id="askWho"></strong> is asking to see how you are going with your reminders.</p>
+      <p class="note"><strong>They would see:</strong> which reminders you have, their times, and whether you marked each one done each day.<br>
+      <strong>They would not see:</strong> your voice recordings, anything you type in "Your words", or anything else on your phone.</p>
+      <label style="color:var(--ink)"><input type="checkbox" id="shareNames" checked> Also share my reminder names (untick to show them only as "Task")</label>
+      <label style="color:var(--ink)"><input type="checkbox" id="agree"> I agree to share this with my clinician. I can stop at any time.</label>
+      <button id="agreeBtn" class="go" type="button">Agree &amp; start sharing</button>
+      <button id="declineBtn" class="alt" type="button">No thanks</button>
+    </div>
+    <div id="connectOn" hidden>
+      <div><strong>✓ Sharing with your clinician</strong> <span id="connName" class="note"></span></div>
+      <button id="discBtn" class="alt" type="button">Stop sharing</button>
+      <div id="stopBox" hidden class="note" style="margin-top:6px">
+        <label style="color:var(--ink)"><input type="checkbox" id="wipe"> Also delete everything already shared with my clinician</label>
+        <button id="stopYes" type="button">Confirm stop</button><button id="stopNo" class="alt" type="button">Cancel</button>
+      </div>
+    </div>
+    <div id="connMsg" class="note" role="status"></div>
+  </div>
+
   <div class="card">
     <h2>All reminders</h2>
     <div id="list"></div>
@@ -155,11 +184,12 @@ async function saveReminder(testIn1){
   const o={id:Date.now().toString(36),title,body:$('body').value.trim(),time,
     reps:Math.max(0,Math.min(60,isNaN(parseInt($('reps').value))?2:parseInt($('reps').value))),speak:$('speak').checked,
     audio:await blobToRec(curBlob),plays:0,lastDone:'',
-    lastFired:(!testIn1&&time<=nowHM())?today():''};
+    lastFired:(!testIn1&&time<=nowHM())?today():'',test:!!testIn1};
   try{
     const stored=await put(o);
     const back=(await all()).find(x=>x.id===o.id);
     if(!back)throw new Error('not found after save');
+    logEv(o,'created');
     const when=o.lastFired?'tomorrow at '+fmt(time):'today at '+fmt(time);
     setMsg('Saved ✓ Your reminder will fire '+when+'. Keep this app open (or installed) at that time.'+(stored?'':' (Storage is unavailable here, so this lasts only until you close the page.)'),true);
   }catch(e){
@@ -170,9 +200,77 @@ async function saveReminder(testIn1){
 $('save').onclick=()=>saveReminder(false);
 $('saveTest').onclick=()=>saveReminder(true);
 
+// ---------- clinician sync (optional) ----------
+const CFG=window.YE_CFG||{};
+const getCode=()=>{try{return localStorage.getItem('ye-code')||''}catch(e){return ''}};
+const qget=()=>{try{return JSON.parse(localStorage.getItem('ye-q')||'[]')}catch(e){return[]}};
+const qset=q=>{try{localStorage.setItem('ye-q',JSON.stringify(q.slice(-300)))}catch(e){}};
+const rpc=(fn,body)=>fetch(CFG.url+'/rest/v1/rpc/'+fn,{method:'POST',headers:{'apikey':CFG.key,'Content-Type':'application/json'},body:JSON.stringify(body)});
+function logEv(r,kind){
+  if(!CFG.url||!getCode()||!r||r.test)return;
+  const q=qget();q.push({p_code:getCode(),p_rid:r.id,p_title:(localStorage.getItem('ye-names')==='0'?'Task':r.title),p_kind:kind,p_time:r.time,p_date:today()});qset(q);flushQ();
+}
+let flushing=false;
+async function flushQ(){
+  if(flushing)return;flushing=true;
+  try{let q=qget();while(q.length){const res=await rpc('log_event',q[0]);if(!res.ok&&res.status>=500)break;q.shift();qset(q)}}catch(e){}
+  flushing=false;
+}
+window.addEventListener('online',flushQ);
+const CONSENT_V=1;
+let pendingCode='';
+function renderConnect(){
+  if(!CFG.url)return;
+  $('connectCard').hidden=false;
+  const on=!!getCode();
+  $('connectIn').hidden=on||!!pendingCode;$('consentBox').hidden=!pendingCode;$('connectOn').hidden=!on;
+  let name='';try{name=localStorage.getItem('ye-name')||''}catch(e){}
+  $('connName').textContent=on&&name?'(as '+name+')':'';
+}
+function dropConn(msg){try{['ye-code','ye-name','ye-q','ye-names'].forEach(k=>localStorage.removeItem(k))}catch(e){}pendingCode='';$('connMsg').textContent=msg||'';renderConnect()}
+$('connectBtn').onclick=async()=>{
+  const c=$('codeIn').value.trim().toUpperCase();
+  if(!c){$('connMsg').textContent='Enter your code first.';return}
+  $('connMsg').textContent='Checking…';
+  try{
+    const res=await rpc('pair',{p_code:c});
+    const nick=res.ok?await res.json():null;
+    if(!nick){$('connMsg').textContent='That code was not recognised. Check it with your clinician.';return}
+    pendingCode=c;$('askWho').textContent='Your clinician ('+nick+')';$('connMsg').textContent='';
+    try{localStorage.setItem('ye-name',nick)}catch(e){}
+    renderConnect();
+  }catch(e){$('connMsg').textContent='No connection. Try again when you are online.'}
+};
+$('declineBtn').onclick=()=>{try{localStorage.removeItem('ye-name')}catch(e){}pendingCode='';$('codeIn').value='';$('connMsg').textContent='Nothing was shared.';renderConnect()};
+$('agreeBtn').onclick=async()=>{
+  if(!$('agree').checked){$('connMsg').textContent='Tick the box to agree, or choose "No thanks".';return}
+  try{
+    const share=$('shareNames').checked;
+    const res=await rpc('consent',{p_code:pendingCode,p_share_titles:share,p_version:CONSENT_V});
+    if(!res.ok)throw new Error('x');
+    try{localStorage.setItem('ye-code',pendingCode);localStorage.setItem('ye-names',share?'1':'0')}catch(e){$('connMsg').textContent='Could not save the connection on this device.';return}
+    pendingCode='';$('codeIn').value='';
+    for(const r of await all())logEv(r,'created');
+    $('connMsg').textContent='Sharing started ✓';renderConnect();
+  }catch(e){$('connMsg').textContent='Could not start sharing. Check your connection and try again.'}
+};
+$('discBtn').onclick=()=>{$('stopBox').hidden=false};
+$('stopNo').onclick=()=>{$('stopBox').hidden=true};
+$('stopYes').onclick=async()=>{
+  const c=getCode();
+  try{await rpc('revoke_sharing',{p_code:c,p_delete:$('wipe').checked})}catch(e){}
+  $('stopBox').hidden=true;$('wipe').checked=false;
+  dropConn('Sharing stopped. Your clinician no longer receives updates.');
+};
+async function checkStatus(){
+  const c=getCode();if(!c||!CFG.url)return;
+  try{const res=await rpc('sharing_status',{p_code:c});if(!res.ok)return;const st=await res.json();
+    if(st&&st!=='sharing')dropConn(st==='stopped_by_clinician'?'Your clinician has stopped monitoring. Sharing is off.':'Sharing is off.')}catch(e){}
+}
+
 // ---------- ringing: loops until the person presses STOP ----------
 const player=new Audio();player.setAttribute('playsinline','');
-let armed=false,ringing=null,wake=null,vibT=null,gapT=null;
+let armed=false,ringTest=false,ringing=null,wake=null,vibT=null,gapT=null;
 const SILENT='data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=';
 async function arm(){
   if(armed)return;
@@ -191,11 +289,11 @@ function stopRing(markDone){
   try{speechSynthesis.cancel()}catch(e){}
   clearTimeout(gapT);clearInterval(vibT);try{navigator.vibrate&&navigator.vibrate(0)}catch(e){}
   $('ring').classList.remove('on');document.title='Ye Oldie Reminder';
-  if(r&&markDone){r.lastDone=today();put(r).catch(()=>{}).then(render)}
+  if(r&&markDone){if(!ringTest)logEv(r,'done');r.lastDone=today();put(r).catch(()=>{}).then(render)}
 }
-function ring(r){
+function ring(r,isTest){
   if(ringing)stopRing(false);
-  ringing=r;r.plays=(r.plays||0)+1;put(r).catch(()=>{});
+  ringing=r;ringTest=!!isTest;if(!isTest)logEv(r,'fired');r.plays=(r.plays||0)+1;put(r).catch(()=>{});
   $('ringT').textContent=r.title;$('ringB').textContent=r.body||'';$('ring').classList.add('on');
   document.title='🔔 '+r.title;
   const gap=(r.reps==null?2:r.reps)*1000;
@@ -255,13 +353,13 @@ async function render(){
     <span class="pill">${r.time} daily</span><span class="pill">${r.audio?'voice':r.speak?'read aloud':'text'}</span><span class="pill">played ${r.plays||0}×</span>
     <div>${r.audio?'<button class="alt" data-play="'+r.id+'">▶ Replay</button>':r.speak?'<button class="alt" data-play="'+r.id+'">▶ Read aloud</button>':''}
     <button class="alt" data-test="${r.id}">Test now</button><button class="alt" data-del="${r.id}">Delete</button></div></div>`).join(''):'<div class="empty">Nothing yet. Add your first reminder above.</div>';
-  document.querySelectorAll('[data-play]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.play);if(r)ring(r)});
+  document.querySelectorAll('[data-play]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.play);if(r)ring(r,true)});
   document.querySelectorAll('[data-done]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.done);if(r)done(r)});
-  document.querySelectorAll('[data-test]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.test);if(r){r.lastDone='';r.lastFired=today();try{await put(r)}catch(e){}render();ring(r)}});
-  document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{await del(b.dataset.del);render()});
+  document.querySelectorAll('[data-test]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.test);if(r){r.lastDone='';r.lastFired=today();try{await put(r)}catch(e){}render();ring(r,true)}});
+  document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.del);logEv(r,'deleted');await del(b.dataset.del);render()});
 }
 
-openDB().then(()=>{renderArm();render();tick();setInterval(tick,5000)});
+openDB().then(()=>{renderConnect();checkStatus().then(flushQ);renderArm();render();tick();setInterval(tick,5000)});
 })();
 </script>
 </body>

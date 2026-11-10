@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Clinician Dashboard · Ye Oldie Reminder</title>
+<script src="config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+:root{--bg:#f4ead5;--card:#fbf5e6;--ink:#3b2a1a;--mute:#7a6650;--acc:#8c3b1f;--ok:#2f5d50;--warn:#b7791f;--bad:#b00020;--line:#d8c7a3}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:Georgia,'Times New Roman',serif;line-height:1.45}
+.wrap{max-width:900px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:1.8rem;margin:.2em 0}
+.sub{color:var(--mute);font-style:italic;margin:0 0 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:12px 0}
+input{padding:10px;border:1px solid var(--line);border-radius:8px;font:inherit;background:#fff;color:var(--ink);width:100%;margin:4px 0 8px}
+button{font:inherit;cursor:pointer;border:1px solid var(--acc);background:var(--acc);color:#fff;border-radius:8px;padding:9px 14px;margin:4px 6px 4px 0}
+button.alt{background:transparent;color:var(--acc)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:space-between}
+table{width:100%;border-collapse:collapse;font-size:.95rem}
+th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mute);font-weight:normal;text-transform:uppercase;font-size:.75rem;letter-spacing:.06em}
+tr.pt{cursor:pointer}
+.chip{display:inline-block;border-radius:99px;padding:2px 10px;font-size:.8rem;color:#fff}
+.ok{background:var(--ok)}.warn{background:var(--warn)}.bad{background:var(--bad)}.none{background:var(--mute)}
+.dots span{display:inline-block;width:22px;text-align:center}
+.d-ok{color:var(--ok)}.d-miss{color:var(--bad)}.d-pend{color:var(--mute)}
+.code{font-size:1.6rem;letter-spacing:.15em;font-weight:bold}
+.note{font-size:.85rem;color:var(--mute)}
+.err{color:var(--bad);font-weight:bold}
+.detail td{background:#fff9ec}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Patient adherence</h1>
+  <p class="sub">Ye Oldie Reminder · clinician view</p>
+  <div id="app"></div>
+</div>
+<script>
+// ---------- pure logic (unit-tested) ----------
+const DAY=86400000;
+function ymd(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')}
+function addDays(s,n){const [y,m,d]=s.split('-').map(Number);return ymd(new Date(y,m-1,d+n))}
+function analyse(events,todayStr,window=7){
+  // reminders: created (earliest local_date) and optional deleted date
+  const rem={};
+  for(const e of events){
+    const r=rem[e.reminder_id]||(rem[e.reminder_id]={id:e.reminder_id,title:e.title,time:e.sched_time,created:null,deleted:null,done:new Set(),fired:new Set()});
+    r.title=e.title;r.time=e.sched_time||r.time;
+    if(e.kind==='created'&&(!r.created||e.local_date<r.created))r.created=e.local_date;
+    if(e.kind==='deleted'&&(!r.deleted||e.local_date>r.deleted))r.deleted=e.local_date;
+    if(e.kind==='done')r.done.add(e.local_date);
+    if(e.kind==='fired')r.fired.add(e.local_date);
+    if(!r.created&&(e.kind==='fired'||e.kind==='done'))r.created=e.local_date;
+  }
+  const start=addDays(todayStr,-(window-1));
+  const days=[];for(let i=0;i<window;i++)days.push(addDays(todayStr,-(window-1)+i));
+  const list=Object.values(rem).filter(r=>r.created&&!(r.deleted&&r.deleted<=start&&r.deleted<todayStr&&r.done.size===0)).map(r=>{
+    r.cells=days.map(d=>{
+      if(d<r.created)return 'na';
+      if(r.done.has(d))return 'done';
+      if(r.deleted&&d>=r.deleted)return 'na';
+      return d===todayStr?'pending':'missed';
+    });
+    return r;
+  }).filter(r=>r.cells.some(c=>c!=='na'));
+  let done=0,missed=0;
+  for(const r of list)for(const c of r.cells){if(c==='done')done++;if(c==='missed')missed++}
+  const adherence=(done+missed)?Math.round(100*done/(done+missed)):null;
+  // streak: consecutive days (back from today, skipping a still-pending today) with every expected reminder done
+  let streak=0;
+  for(let i=days.length-1;i>=0;i--){
+    const cs=list.map(r=>r.cells[i]).filter(c=>c!=='na');
+    if(!cs.length)break;
+    if(cs.every(c=>c==='done'))streak++;
+    else if(i===days.length-1&&!cs.includes('missed'))continue; // today still pending
+    else break;
+  }
+  const todayCells=list.map(r=>r.cells[days.length-1]).filter(c=>c!=='na');
+  const todayDone=todayCells.filter(c=>c==='done').length;
+  let status='none';
+  if(adherence!==null)status=adherence>=80?'ok':adherence>=50?'warn':'bad';
+  return {list,days,done,missed,adherence,streak,todayDone,todayTotal:todayCells.length,status};
+}
+if(typeof module!=='undefined')module.exports={analyse,addDays};
+
+// ---------- app ----------
+if(typeof document!=='undefined'&&document.getElementById('app')){
+const cfg=window.YE_CFG||{};
+const app=document.getElementById('app');
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const APP_URL=location.href.replace(/clinician\.html.*$/,'');
+let sb=null,patients=[],events={},open=null;
+if(!cfg.url||!window.supabase){app.innerHTML='<div class="card">Backend not connected yet. Add your Supabase URL and key to <code>config.js</code>.</div>'}
+else{sb=window.supabase.createClient(cfg.url,cfg.key);boot()}
+
+async function boot(){
+  const {data}=await sb.auth.getSession();
+  data.session?load():loginView();
+}
+function loginView(msg){
+  app.innerHTML=`<div class="card"><h2 style="margin-top:0">Sign in</h2>
+  <input id="em" type="email" placeholder="Email" autocomplete="username">
+  <input id="pw" type="password" placeholder="Password" autocomplete="current-password">
+  <button id="go">Sign in</button><div class="err" id="msg">${msg||''}</div></div>`;
+  const go=async()=>{
+    const {error}=await sb.auth.signInWithPassword({email:document.getElementById('em').value.trim(),password:document.getElementById('pw').value});
+    error?document.getElementById('msg').textContent='Sign-in failed. Check your email and password.':load();
+  };
+  document.getElementById('go').onclick=go;
+  document.getElementById('pw').onkeydown=e=>{if(e.key==='Enter')go()};
+}
+async function load(){
+  app.innerHTML='<div class="card">Loading…</div>';
+  const p=await sb.from('patients').select('*').order('created_at');
+  if(p.error){loginView('Could not load. Please sign in again.');return}
+  patients=p.data;
+  const since=addDays(ymd(new Date()),-30);
+  events={};
+  let from=0;
+  for(;;){
+    const r=await sb.from('events').select('*').gte('local_date',since).order('at').range(from,from+999);
+    if(r.error||!r.data.length)break;
+    for(const e of r.data)(events[e.patient_id]||(events[e.patient_id]=[])).push(e);
+    if(r.data.length<1000)break;from+=1000;
+  }
+  render();
+}
+const state=p=>p.revoked_at?'revoked':p.consented_at?'sharing':'pending';
+function rank(x){const st=state(x.p);if(st!=='sharing')return st==='pending'?5:6;const a=x.a;return a.status==='bad'?0:a.status==='warn'?1:a.status==='none'?2:3}
+function render(newCode){
+  const today=ymd(new Date());
+  const rows=patients.filter(p=>p.active).map(p=>({p,a:state(p)==='sharing'?analyse(events[p.id]||[],today):null})).sort((x,y)=>rank(x)-rank(y));
+  const label={ok:'On track',warn:'Watch',bad:'Needs attention',none:'No data yet'};
+  let h=`<div class="card"><div class="row"><strong>Add a patient</strong></div>
+    <div class="row"><input id="nick" placeholder="Patient nickname or initials (no full names)" style="flex:1"><button id="add">Create code</button></div>
+    <div class="note">Use initials or an ID only. Nothing is shared until the patient enters the code and explicitly agrees.</div>
+    ${newCode?`<div style="margin-top:10px"><div class="code">${esc(newCode.code)}</div><div>For <strong>${esc(newCode.nick)}</strong>. Tell them to open <strong>${esc(APP_URL)}</strong>, install it, and enter this code under "Share with your clinician". They will be asked to agree before anything is shared.</div></div>`:''}</div>`;
+  h+=`<div class="card"><div class="row"><strong>Patients (${rows.length})</strong><button class="alt" id="refresh">Refresh</button><button class="alt" id="out">Sign out</button></div>`;
+  if(!rows.length)h+='<p class="note">No patients yet.</p>';
+  else{
+    h+='<table><tr><th>Patient</th><th>Today</th><th>7-day</th><th>Streak</th><th>Status</th></tr>';
+    for(const {p,a} of rows){
+      const st=state(p);
+      if(st!=='sharing'){
+        const msg=st==='pending'?'Invite sent. Waiting for the patient to accept. No data is shared until they agree.':'The patient stopped sharing'+(p.revoked_at?' on '+new Date(p.revoked_at).toLocaleDateString():'')+'. No data is available.';
+        h+=`<tr><td><strong>${esc(p.nickname)}</strong><br><span class="note">code ${esc(p.code)}</span></td><td colspan="3" class="note">${msg}</td><td><span class="chip none">${st==='pending'?'Awaiting patient':'Stopped by patient'}</span></td></tr>
+        <tr><td colspan="5"><button class="alt" data-del="${p.id}">Remove from list</button></td></tr>`;
+        continue;
+      }
+      h+=`<tr class="pt" data-id="${p.id}"><td><strong>${esc(p.nickname)}</strong><br><span class="note">sharing since ${new Date(p.consented_at).toLocaleDateString()}${p.share_titles?'':' · names hidden by patient'}</span></td>
+        <td>${a.todayTotal?a.todayDone+'/'+a.todayTotal:'–'}</td>
+        <td>${a.adherence===null?'–':a.adherence+'%'}</td><td>${a.streak?a.streak+' d':'–'}</td>
+        <td><span class="chip ${a.status}">${label[a.status]}</span></td></tr>`;
+      if(open===p.id){
+        h+=`<tr class="detail"><td colspan="5">`;
+        if(!a.list.length)h+='<span class="note">No reminders synced yet. The patient must open the app.</span>';
+        else{
+          h+='<table><tr><th>Reminder</th><th>Time</th><th class="dots">Last 7 days</th></tr>';
+          for(const r of a.list){
+            h+=`<tr><td>${esc(r.title)}${r.deleted?' <span class="note">(removed)</span>':''}</td><td>${esc(r.time||'')}</td><td class="dots">${r.cells.map(c=>c==='done'?'<span class="d-ok">✓</span>':c==='missed'?'<span class="d-miss">✗</span>':c==='pending'?'<span class="d-pend">…</span>':'<span class="d-pend">·</span>').join('')}</td></tr>`;
+          }
+          h+='</table><div class="note">Oldest day on the left, today on the right. ✓ done · ✗ not done · … due today · · not set yet. A ✗ also appears if the app was not opened that day.</div>';
+        }
+        h+=`<div style="margin-top:8px"><button class="alt" data-stop="${p.id}">Stop monitoring</button> <button class="alt" data-del="${p.id}">Delete patient &amp; data</button></div></td></tr>`;
+      }
+    }
+    h+='</table>';
+  }
+  h+='</div>';
+  app.innerHTML=h;
+  document.getElementById('add').onclick=addPatient;
+  document.getElementById('refresh').onclick=load;
+  document.getElementById('out').onclick=async()=>{await sb.auth.signOut();loginView()};
+  app.querySelectorAll('tr.pt').forEach(tr=>tr.onclick=()=>{open=open===tr.dataset.id?null:tr.dataset.id;render()});
+  app.querySelectorAll('[data-stop]').forEach(b=>b.onclick=async()=>{await sb.from('patients').update({active:false}).eq('id',b.dataset.stop);open=null;load()});
+  app.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{
+    if(!confirm('Permanently delete this patient and all their data? This cannot be undone.'))return;
+    await sb.from('patients').delete().eq('id',b.dataset.del);open=null;load()});
+}
+async function addPatient(){
+  const nick=document.getElementById('nick').value.trim();
+  if(!nick)return;
+  const A='ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  const code=Array.from(crypto.getRandomValues(new Uint8Array(8)),b=>A[b%A.length]).join('');
+  const r=await sb.from('patients').insert({nickname:nick,code}).select().single();
+  if(r.error){alert('Could not create the patient. Try again.');return}
+  patients.push(r.data);render({code,nick});
+}
+}
+</script>
+</body>
+</html>
