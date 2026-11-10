@@ -35,13 +35,21 @@ button:disabled{opacity:.5;cursor:default}
 .note{font-size:.85rem;color:var(--mute)}
 audio{width:100%;margin-top:8px}
 .empty{color:var(--mute);font-style:italic}
+.ring{position:fixed;inset:0;z-index:99;background:#8c3b1f;color:#fff;display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px}
+.ring.on{display:flex;animation:pulse 1.2s infinite}
+@keyframes pulse{50%{background:#a8481f}}
+.ring h1{font-size:2.2rem;margin:.2em 0}.ring p{font-size:1.2rem;margin:.2em 0 1.2em}
+.ring button{font-size:1.6rem;padding:22px 48px;background:#fff;color:#8c3b1f;border:0;border-radius:14px;font-weight:bold;margin:8px}
+.arm{background:#fff1dc;border:1px solid var(--acc);border-radius:10px;padding:12px;margin:12px 0}
 </style>
 </head>
 <body>
+<div id="ring" class="ring" role="alertdialog"><div style="font-size:3rem">🔔</div><h1 id="ringT"></h1><p id="ringB"></p><button id="ringStop" type="button">■ STOP</button></div>
 <div class="wrap">
   <h1>Ye Oldie Reminder</h1>
   <p class="sub">Remembered your way. In your voice, your words, as often as you like.</p>
 
+  <div id="armBox"></div>
   <div id="today"></div>
 
   <div class="card">
@@ -65,9 +73,9 @@ audio{width:100%;margin-top:8px}
 
     <div class="row">
       <div><label>Time each day</label><input type="time" id="time" value="09:00"></div>
-      <div><label>Replays when it fires</label><input type="number" id="reps" min="1" max="10" value="1"></div>
+      <div><label>Seconds between repeats</label><input type="number" id="reps" min="0" max="60" value="2"></div>
     </div>
-    <label><input type="checkbox" id="speak"> Read my words aloud if no recording</label>
+    <label><input type="checkbox" id="speak"> Speak my words aloud if there is no recording</label>
     <button id="save" class="go big" type="button">Save reminder</button>
     <button id="saveTest" class="alt" type="button">Save &amp; test in 1 minute</button>
     <div id="saveMsg" class="note" role="status" style="margin-top:8px"></div>
@@ -145,7 +153,7 @@ async function saveReminder(testIn1){
   if(testIn1){const d=new Date(Date.now()+60000);time=pad(d.getHours())+':'+pad(d.getMinutes())}
   if(!time){setMsg('Choose a time first.',false);return}
   const o={id:Date.now().toString(36),title,body:$('body').value.trim(),time,
-    reps:Math.max(1,Math.min(10,+$('reps').value||1)),speak:$('speak').checked,
+    reps:Math.max(0,Math.min(60,isNaN(parseInt($('reps').value))?2:parseInt($('reps').value))),speak:$('speak').checked,
     audio:await blobToRec(curBlob),plays:0,lastDone:'',
     lastFired:(!testIn1&&time<=nowHM())?today():''};
   try{
@@ -162,24 +170,48 @@ async function saveReminder(testIn1){
 $('save').onclick=()=>saveReminder(false);
 $('saveTest').onclick=()=>saveReminder(true);
 
-// ---------- playback ----------
-let currentAudio=null;
-function speakText(t){try{speechSynthesis.cancel();speechSynthesis.speak(new SpeechSynthesisUtterance(t))}catch(e){}}
-async function play(r){
-  r.plays=(r.plays||0)+1;try{await put(r)}catch(e){}
-  const times=r.reps||1;let n=0;
-  const once=()=>{
-    if(r.audio){
-      if(currentAudio){currentAudio.pause()}
-      currentAudio=new Audio(URL.createObjectURL(recToBlob(r.audio)));
-      currentAudio.onended=()=>{if(++n<times)once()};
-      currentAudio.play().catch(()=>{$('today').insertAdjacentHTML('afterbegin','<div class="card due">Tap Play to hear it (your phone needs a tap first).</div>')});
-    }else if(r.speak){
-      try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(r.body||r.title);u.onend=()=>{if(++n<times)once()};speechSynthesis.speak(u)}catch(e){}
-    }};
-  once();render();
+// ---------- ringing: loops until the person presses STOP ----------
+const player=new Audio();player.setAttribute('playsinline','');
+let armed=false,ringing=null,wake=null,vibT=null,gapT=null;
+const SILENT='data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=';
+async function arm(){
+  if(armed)return;
+  try{player.src=SILENT;await player.play();player.pause();armed=true}catch(e){}
+  try{if('wakeLock' in navigator)wake=await navigator.wakeLock.request('screen')}catch(e){}
+  try{if(window.Notification&&Notification.permission==='default')Notification.requestPermission().catch(()=>{})}catch(e){}
+  renderArm();
 }
-async function done(r){r.lastDone=today();try{await put(r)}catch(e){}render()}
+document.addEventListener('click',arm,{once:false,capture:true});
+document.addEventListener('touchend',arm,{capture:true});
+document.addEventListener('visibilitychange',async()=>{if(!document.hidden&&armed&&'wakeLock' in navigator){try{wake=await navigator.wakeLock.request('screen')}catch(e){}}});
+function renderArm(){$('armBox').innerHTML=armed?'':'<div class="arm"><strong>Tap here once to turn sound on</strong> so reminders can play by themselves.<br><button class="go" id="armBtn" type="button">Turn on sound &amp; keep screen awake</button></div>';const b=$('armBtn');if(b)b.onclick=arm}
+function stopRing(markDone){
+  const r=ringing;ringing=null;
+  try{player.pause();player.loop=false}catch(e){}
+  try{speechSynthesis.cancel()}catch(e){}
+  clearTimeout(gapT);clearInterval(vibT);try{navigator.vibrate&&navigator.vibrate(0)}catch(e){}
+  $('ring').classList.remove('on');document.title='Ye Oldie Reminder';
+  if(r&&markDone){r.lastDone=today();put(r).catch(()=>{}).then(render)}
+}
+function ring(r){
+  if(ringing)stopRing(false);
+  ringing=r;r.plays=(r.plays||0)+1;put(r).catch(()=>{});
+  $('ringT').textContent=r.title;$('ringB').textContent=r.body||'';$('ring').classList.add('on');
+  document.title='🔔 '+r.title;
+  const gap=(r.reps==null?2:r.reps)*1000;
+  const loop=()=>{
+    if(ringing!==r)return;
+    if(r.audio){
+      player.loop=false;player.src=URL.createObjectURL(recToBlob(r.audio));
+      player.onended=()=>{gapT=setTimeout(loop,gap)};
+      player.play().catch(()=>{});
+    }else if(r.speak){
+      try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance((r.body||r.title));u.onend=()=>{gapT=setTimeout(loop,gap)};speechSynthesis.speak(u)}catch(e){gapT=setTimeout(loop,gap)}
+    }};
+  loop();
+  try{navigator.vibrate&&navigator.vibrate([400,200,400]);vibT=setInterval(()=>{try{navigator.vibrate([400,200,400])}catch(e){}},3000)}catch(e){}
+}
+$('ringStop').onclick=()=>stopRing(true);
 
 // ---------- schedule ----------
 const today=()=>new Date().toLocaleDateString('en-CA');
@@ -193,8 +225,7 @@ async function tick(){
       try{if(window.Notification&&Notification.permission==='granted'){
         const reg=navigator.serviceWorker&&await navigator.serviceWorker.getRegistration();
         reg&&reg.showNotification?reg.showNotification('Reminder',{body:r.title,tag:r.id}):new Notification('Reminder',{body:r.title})}}catch(e){}
-      try{document.title='🔔 '+r.title}catch(e){}
-      if(r.audio||r.speak)play(r);
+      ring(r);
     }}
   if(changed)render();
 }
@@ -212,7 +243,7 @@ async function render(){
   let h='';
   if(due.length){
     h+=due.map(r=>`<div class="card due"><h2>Remember now</h2><div class="msg">${esc(r.title)}</div>${r.body?`<div>${esc(r.body)}</div>`:''}
-      <button class="go big" data-play="${r.id}">▶ Play${r.audio?' my voice':''}</button>
+      <button class="go big" data-play="${r.id}">▶ Play again</button>
       <button class="alt" data-done="${r.id}">✓ Done</button></div>`).join('');
   }else if(upcoming.length){
     const nx=upcoming.find(r=>r.time>now)||upcoming[0];
@@ -224,13 +255,13 @@ async function render(){
     <span class="pill">${r.time} daily</span><span class="pill">${r.audio?'voice':r.speak?'read aloud':'text'}</span><span class="pill">played ${r.plays||0}×</span>
     <div>${r.audio?'<button class="alt" data-play="'+r.id+'">▶ Replay</button>':r.speak?'<button class="alt" data-play="'+r.id+'">▶ Read aloud</button>':''}
     <button class="alt" data-test="${r.id}">Test now</button><button class="alt" data-del="${r.id}">Delete</button></div></div>`).join(''):'<div class="empty">Nothing yet. Add your first reminder above.</div>';
-  document.querySelectorAll('[data-play]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.play);if(r)play(r)});
+  document.querySelectorAll('[data-play]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.play);if(r)ring(r)});
   document.querySelectorAll('[data-done]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.done);if(r)done(r)});
-  document.querySelectorAll('[data-test]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.test);if(r){r.lastDone='';r.lastFired=today();try{await put(r)}catch(e){}render();if(r.audio||r.speak)play(r)}});
+  document.querySelectorAll('[data-test]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.test);if(r){r.lastDone='';r.lastFired=today();try{await put(r)}catch(e){}render();ring(r)}});
   document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{await del(b.dataset.del);render()});
 }
 
-openDB().then(()=>{render();tick();setInterval(tick,5000)});
+openDB().then(()=>{renderArm();render();tick();setInterval(tick,5000)});
 })();
 </script>
 </body>
