@@ -69,6 +69,8 @@ audio{width:100%;margin-top:8px}
     </div>
     <label><input type="checkbox" id="speak"> Read my words aloud if no recording</label>
     <button id="save" class="go big" type="button">Save reminder</button>
+    <button id="saveTest" class="alt" type="button">Save &amp; test in 1 minute</button>
+    <div id="saveMsg" class="note" role="status" style="margin-top:8px"></div>
     <div class="note" id="micNote"></div>
   </div>
 
@@ -83,21 +85,27 @@ audio{width:100%;margin-top:8px}
 const $=id=>document.getElementById(id);
 let db=null, mem=[], blobMem={}, recorder=null, chunks=[], curBlob=null, stream=null;
 
-// ---------- storage (IndexedDB, falls back to memory) ----------
+// ---------- storage (IndexedDB; audio kept as bytes so iPhones store it reliably) ----------
 function openDB(){return new Promise(res=>{
   try{const r=indexedDB.open('ye-oldie',1);
     r.onupgradeneeded=()=>r.result.createObjectStore('r',{keyPath:'id'});
-    r.onsuccess=()=>{db=r.result;res()};r.onerror=()=>res();
+    r.onsuccess=()=>{db=r.result;res()};r.onerror=()=>res();r.onblocked=()=>res();
   }catch(e){res()}});}
 function all(){return new Promise(res=>{
   if(!db)return res(mem.slice());
   try{const q=db.transaction('r').objectStore('r').getAll();q.onsuccess=()=>res(q.result);q.onerror=()=>res(mem.slice())}catch(e){res(mem.slice())}});}
-function put(o){return new Promise(res=>{
-  if(!db){const i=mem.findIndex(x=>x.id===o.id);i<0?mem.push(o):mem[i]=o;return res()}
-  try{const t=db.transaction('r','readwrite');t.objectStore('r').put(o);t.oncomplete=()=>res();t.onerror=()=>res()}catch(e){res()}});}
+function put(o){return new Promise((res,rej)=>{
+  const keep=()=>{const i=mem.findIndex(x=>x.id===o.id);i<0?mem.push(o):mem[i]=o};
+  if(!db){keep();return res(false)}
+  try{const t=db.transaction('r','readwrite');t.objectStore('r').put(o);
+    t.oncomplete=()=>res(true);t.onerror=()=>{keep();rej(t.error||new Error('write failed'))};t.onabort=()=>{keep();rej(t.error||new Error('write aborted'))}
+  }catch(e){keep();rej(e)}});}
 function del(id){return new Promise(res=>{
-  if(!db){mem=mem.filter(x=>x.id!==id);return res()}
-  try{const t=db.transaction('r','readwrite');t.objectStore('r').delete(id);t.oncomplete=()=>res()}catch(e){res()}});}
+  mem=mem.filter(x=>x.id!==id);
+  if(!db)return res();
+  try{const t=db.transaction('r','readwrite');t.objectStore('r').delete(id);t.oncomplete=()=>res();t.onerror=()=>res()}catch(e){res()}});}
+async function blobToRec(b){return b?{buf:await b.arrayBuffer(),type:b.type||'audio/mp4'}:null}
+const recToBlob=a=>a?new Blob([a.buf],{type:a.type}):null;
 
 // ---------- recording ----------
 $('micNote').textContent='';
@@ -127,34 +135,51 @@ $('file').onchange=e=>{const f=e.target.files[0];if(!f)return;curBlob=f;showPrev
 function showPreview(){const a=$('preview');a.src=URL.createObjectURL(curBlob);a.hidden=false}
 
 // ---------- save ----------
-$('save').onclick=async()=>{
+const pad=n=>String(n).padStart(2,'0');
+const fmt=t=>{const[h,m]=t.split(':').map(Number);return (h%12||12)+':'+pad(m)+(h<12?' am':' pm')};
+function setMsg(t,ok){const m=$('saveMsg');m.textContent=t;m.style.color=ok?'#2f5d50':'#b00020';m.style.fontWeight='bold'}
+async function saveReminder(testIn1){
   const title=$('title').value.trim();
-  if(!title){$('title').focus();return}
-  await put({id:Date.now().toString(36),title,body:$('body').value.trim(),time:$('time').value||'09:00',
-    reps:Math.max(1,Math.min(10,+$('reps').value||1)),speak:$('speak').checked,audio:curBlob||null,
-    plays:0,lastDone:'',lastFired:''});
+  if(!title){setMsg('Type what you need to remember first.',false);$('title').focus();return}
+  let time=$('time').value;
+  if(testIn1){const d=new Date(Date.now()+60000);time=pad(d.getHours())+':'+pad(d.getMinutes())}
+  if(!time){setMsg('Choose a time first.',false);return}
+  const o={id:Date.now().toString(36),title,body:$('body').value.trim(),time,
+    reps:Math.max(1,Math.min(10,+$('reps').value||1)),speak:$('speak').checked,
+    audio:await blobToRec(curBlob),plays:0,lastDone:'',
+    lastFired:(!testIn1&&time<=nowHM())?today():''};
+  try{
+    const stored=await put(o);
+    const back=(await all()).find(x=>x.id===o.id);
+    if(!back)throw new Error('not found after save');
+    const when=o.lastFired?'tomorrow at '+fmt(time):'today at '+fmt(time);
+    setMsg('Saved ✓ Your reminder will fire '+when+'. Keep this app open (or installed) at that time.'+(stored?'':' (Storage is unavailable here, so this lasts only until you close the page.)'),true);
+  }catch(e){
+    setMsg('Could not save on this device ('+(e&&e.name||'error')+'). Try removing the audio, or reopen the app and try again.',false);return}
   $('title').value='';$('body').value='';curBlob=null;$('preview').hidden=true;$('recStatus').textContent='';
   render();
-};
+}
+$('save').onclick=()=>saveReminder(false);
+$('saveTest').onclick=()=>saveReminder(true);
 
 // ---------- playback ----------
 let currentAudio=null;
 function speakText(t){try{speechSynthesis.cancel();speechSynthesis.speak(new SpeechSynthesisUtterance(t))}catch(e){}}
 async function play(r){
-  r.plays=(r.plays||0)+1;await put(r);
+  r.plays=(r.plays||0)+1;try{await put(r)}catch(e){}
   const times=r.reps||1;let n=0;
   const once=()=>{
     if(r.audio){
       if(currentAudio){currentAudio.pause()}
-      currentAudio=new Audio(URL.createObjectURL(r.audio));
+      currentAudio=new Audio(URL.createObjectURL(recToBlob(r.audio)));
       currentAudio.onended=()=>{if(++n<times)once()};
-      currentAudio.play().catch(()=>{});
+      currentAudio.play().catch(()=>{$('today').insertAdjacentHTML('afterbegin','<div class="card due">Tap Play to hear it (your phone needs a tap first).</div>')});
     }else if(r.speak){
       try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(r.body||r.title);u.onend=()=>{if(++n<times)once()};speechSynthesis.speak(u)}catch(e){}
     }};
   once();render();
 }
-async function done(r){r.lastDone=today();await put(r);render()}
+async function done(r){r.lastDone=today();try{await put(r)}catch(e){}render()}
 
 // ---------- schedule ----------
 const today=()=>new Date().toLocaleDateString('en-CA');
@@ -163,12 +188,19 @@ async function tick(){
   const rs=await all();let changed=false;
   for(const r of rs){
     if(r.time<=nowHM()&&r.lastFired!==today()){
-      r.lastFired=today();await put(r);changed=true;
-      try{if(window.Notification&&Notification.permission==='granted')new Notification('Reminder',{body:r.title})}catch(e){}
+      r.lastFired=today();try{await put(r)}catch(e){}changed=true;
+      try{navigator.vibrate&&navigator.vibrate([300,150,300])}catch(e){}
+      try{if(window.Notification&&Notification.permission==='granted'){
+        const reg=navigator.serviceWorker&&await navigator.serviceWorker.getRegistration();
+        reg&&reg.showNotification?reg.showNotification('Reminder',{body:r.title,tag:r.id}):new Notification('Reminder',{body:r.title})}}catch(e){}
+      try{document.title='🔔 '+r.title}catch(e){}
+      if(r.audio||r.speak)play(r);
     }}
   if(changed)render();
 }
-try{if(window.Notification&&Notification.permission==='default')Notification.requestPermission().catch(()=>{})}catch(e){}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)tick()});
+window.addEventListener('focus',tick);
+document.addEventListener('click',function(){try{if(window.Notification&&Notification.permission==='default')Notification.requestPermission().catch(()=>{})}catch(e){}},{once:true});
 
 // ---------- render ----------
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
@@ -191,13 +223,14 @@ async function render(){
     <strong>${esc(r.title)}</strong><br>
     <span class="pill">${r.time} daily</span><span class="pill">${r.audio?'voice':r.speak?'read aloud':'text'}</span><span class="pill">played ${r.plays||0}×</span>
     <div>${r.audio?'<button class="alt" data-play="'+r.id+'">▶ Replay</button>':r.speak?'<button class="alt" data-play="'+r.id+'">▶ Read aloud</button>':''}
-    <button class="alt" data-del="${r.id}">Delete</button></div></div>`).join(''):'<div class="empty">Nothing yet. Add your first reminder above.</div>';
+    <button class="alt" data-test="${r.id}">Test now</button><button class="alt" data-del="${r.id}">Delete</button></div></div>`).join(''):'<div class="empty">Nothing yet. Add your first reminder above.</div>';
   document.querySelectorAll('[data-play]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.play);if(r)play(r)});
   document.querySelectorAll('[data-done]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.done);if(r)done(r)});
+  document.querySelectorAll('[data-test]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.test);if(r){r.lastDone='';r.lastFired=today();try{await put(r)}catch(e){}render();if(r.audio||r.speak)play(r)}});
   document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{await del(b.dataset.del);render()});
 }
 
-openDB().then(()=>{render();tick();setInterval(tick,15000)});
+openDB().then(()=>{render();tick();setInterval(tick,5000)});
 })();
 </script>
 </body>
