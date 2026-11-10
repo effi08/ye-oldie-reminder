@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ye Oldie Reminder</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#8c3b1f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Reminder">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+:root{--bg:#f4ead5;--card:#fbf5e6;--ink:#3b2a1a;--mute:#7a6650;--acc:#8c3b1f;--acc2:#2f5d50;--line:#d8c7a3}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:Georgia,'Times New Roman',serif;line-height:1.45}
+.wrap{max-width:640px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:2rem;margin:.2em 0 0;letter-spacing:.02em}
+.sub{color:var(--mute);margin:0 0 18px;font-style:italic}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:12px 0;box-shadow:0 1px 0 rgba(0,0,0,.04)}
+h2{font-size:1.05rem;margin:0 0 8px;text-transform:uppercase;letter-spacing:.08em;color:var(--mute)}
+label{display:block;font-size:.9rem;color:var(--mute);margin:10px 0 4px}
+input[type=text],input[type=time],input[type=number],textarea{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:#fff;font:inherit;color:var(--ink)}
+textarea{min-height:70px;resize:vertical}
+button{font:inherit;cursor:pointer;border:1px solid var(--acc);background:var(--acc);color:#fff;border-radius:8px;padding:10px 14px;margin:4px 6px 4px 0}
+button.alt{background:transparent;color:var(--acc)}
+button.go{background:var(--acc2);border-color:var(--acc2)}
+button.big{font-size:1.15rem;padding:14px 20px}
+button:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.row>*{flex:1 1 120px}
+.pill{display:inline-block;font-size:.78rem;border:1px solid var(--line);border-radius:99px;padding:2px 9px;color:var(--mute);margin-right:6px}
+.due{border-color:var(--acc);background:#fff1dc}
+.msg{font-size:1.25rem;margin:4px 0 10px}
+.rec{color:#b00020;font-weight:bold}
+.note{font-size:.85rem;color:var(--mute)}
+audio{width:100%;margin-top:8px}
+.empty{color:var(--mute);font-style:italic}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Ye Oldie Reminder</h1>
+  <p class="sub">Remembered your way. In your voice, your words, as often as you like.</p>
+
+  <div id="today"></div>
+
+  <div class="card">
+    <h2>New reminder</h2>
+    <label>What do you need to remember?</label>
+    <input type="text" id="title" placeholder="e.g. Have a glass of water">
+    <label>Your words (optional, shown on screen and can be read aloud)</label>
+    <textarea id="body" placeholder="e.g. Your kidneys and blood pressure thank you."></textarea>
+
+    <label>Your voice</label>
+    <div class="row">
+      <button id="recBtn" class="alt" type="button">● Record</button>
+      <button id="stopBtn" class="alt" type="button" disabled>■ Stop</button>
+      <button id="phoneBtn" class="alt" type="button">🎙 Use phone recorder</button>
+      <button id="upBtn" class="alt" type="button">Upload audio</button>
+    </div>
+    <input type="file" id="file" accept="audio/*" hidden>
+    <input type="file" id="cap" accept="audio/*" capture hidden>
+    <div id="recStatus" class="note"></div>
+    <audio id="preview" controls hidden></audio>
+
+    <div class="row">
+      <div><label>Time each day</label><input type="time" id="time" value="09:00"></div>
+      <div><label>Replays when it fires</label><input type="number" id="reps" min="1" max="10" value="1"></div>
+    </div>
+    <label><input type="checkbox" id="speak"> Read my words aloud if no recording</label>
+    <button id="save" class="go big" type="button">Save reminder</button>
+    <div class="note" id="micNote"></div>
+  </div>
+
+  <div class="card">
+    <h2>All reminders</h2>
+    <div id="list"></div>
+  </div>
+</div>
+
+<script>
+(function(){
+const $=id=>document.getElementById(id);
+let db=null, mem=[], blobMem={}, recorder=null, chunks=[], curBlob=null, stream=null;
+
+// ---------- storage (IndexedDB, falls back to memory) ----------
+function openDB(){return new Promise(res=>{
+  try{const r=indexedDB.open('ye-oldie',1);
+    r.onupgradeneeded=()=>r.result.createObjectStore('r',{keyPath:'id'});
+    r.onsuccess=()=>{db=r.result;res()};r.onerror=()=>res();
+  }catch(e){res()}});}
+function all(){return new Promise(res=>{
+  if(!db)return res(mem.slice());
+  try{const q=db.transaction('r').objectStore('r').getAll();q.onsuccess=()=>res(q.result);q.onerror=()=>res(mem.slice())}catch(e){res(mem.slice())}});}
+function put(o){return new Promise(res=>{
+  if(!db){const i=mem.findIndex(x=>x.id===o.id);i<0?mem.push(o):mem[i]=o;return res()}
+  try{const t=db.transaction('r','readwrite');t.objectStore('r').put(o);t.oncomplete=()=>res();t.onerror=()=>res()}catch(e){res()}});}
+function del(id){return new Promise(res=>{
+  if(!db){mem=mem.filter(x=>x.id!==id);return res()}
+  try{const t=db.transaction('r','readwrite');t.objectStore('r').delete(id);t.oncomplete=()=>res()}catch(e){res()}});}
+
+// ---------- recording ----------
+$('micNote').textContent='';
+$('recBtn').onclick=async()=>{
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:true});
+    chunks=[];
+    const mt=['audio/webm;codecs=opus','audio/mp4','audio/webm','audio/ogg'].find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported(t));
+    recorder=mt?new MediaRecorder(stream,{mimeType:mt}):new MediaRecorder(stream);
+    recorder.ondataavailable=e=>chunks.push(e.data);
+    recorder.onstop=()=>{curBlob=new Blob(chunks,{type:recorder.mimeType||'audio/webm'});showPreview();stream.getTracks().forEach(t=>t.stop());$('recStatus').textContent='Recorded. Play it back below, or record again.'};
+    recorder.start();
+    $('recBtn').disabled=true;$('stopBtn').disabled=false;
+    $('recStatus').innerHTML='<span class="rec">● Recording…</span> speak now';
+  }catch(e){
+    $('recBtn').disabled=false;$('stopBtn').disabled=true;
+    const denied=e&&(e.name==='NotAllowedError'||e.name==='SecurityError');
+    $('recStatus').textContent=denied?'Microphone blocked. Allow microphone access for this site in your browser settings, or use the phone recorder button.':'Live recording is not available here. Use the phone recorder button.';
+  }};
+$('phoneBtn').onclick=()=>$('cap').click();
+$('cap').onchange=e=>{const f=e.target.files[0];if(!f)return;curBlob=f;showPreview();$('recStatus').textContent='Recording attached.'};
+try{if(navigator.storage&&navigator.storage.persist)navigator.storage.persist()}catch(e){}
+try{if('serviceWorker' in navigator&&location.protocol.startsWith('http'))navigator.serviceWorker.register('sw.js').catch(()=>{})}catch(e){}
+$('stopBtn').onclick=()=>{if(recorder&&recorder.state==='recording')recorder.stop();$('recBtn').disabled=false;$('stopBtn').disabled=true};
+$('upBtn').onclick=()=>$('file').click();
+$('file').onchange=e=>{const f=e.target.files[0];if(!f)return;curBlob=f;showPreview();$('recStatus').textContent='Loaded: '+f.name};
+function showPreview(){const a=$('preview');a.src=URL.createObjectURL(curBlob);a.hidden=false}
+
+// ---------- save ----------
+$('save').onclick=async()=>{
+  const title=$('title').value.trim();
+  if(!title){$('title').focus();return}
+  await put({id:Date.now().toString(36),title,body:$('body').value.trim(),time:$('time').value||'09:00',
+    reps:Math.max(1,Math.min(10,+$('reps').value||1)),speak:$('speak').checked,audio:curBlob||null,
+    plays:0,lastDone:'',lastFired:''});
+  $('title').value='';$('body').value='';curBlob=null;$('preview').hidden=true;$('recStatus').textContent='';
+  render();
+};
+
+// ---------- playback ----------
+let currentAudio=null;
+function speakText(t){try{speechSynthesis.cancel();speechSynthesis.speak(new SpeechSynthesisUtterance(t))}catch(e){}}
+async function play(r){
+  r.plays=(r.plays||0)+1;await put(r);
+  const times=r.reps||1;let n=0;
+  const once=()=>{
+    if(r.audio){
+      if(currentAudio){currentAudio.pause()}
+      currentAudio=new Audio(URL.createObjectURL(r.audio));
+      currentAudio.onended=()=>{if(++n<times)once()};
+      currentAudio.play().catch(()=>{});
+    }else if(r.speak){
+      try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(r.body||r.title);u.onend=()=>{if(++n<times)once()};speechSynthesis.speak(u)}catch(e){}
+    }};
+  once();render();
+}
+async function done(r){r.lastDone=today();await put(r);render()}
+
+// ---------- schedule ----------
+const today=()=>new Date().toLocaleDateString('en-CA');
+const nowHM=()=>{const d=new Date();return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')};
+async function tick(){
+  const rs=await all();let changed=false;
+  for(const r of rs){
+    if(r.time<=nowHM()&&r.lastFired!==today()){
+      r.lastFired=today();await put(r);changed=true;
+      try{if(window.Notification&&Notification.permission==='granted')new Notification('Reminder',{body:r.title})}catch(e){}
+    }}
+  if(changed)render();
+}
+try{if(window.Notification&&Notification.permission==='default')Notification.requestPermission().catch(()=>{})}catch(e){}
+
+// ---------- render ----------
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function render(){
+  const rs=(await all()).sort((a,b)=>a.time.localeCompare(b.time));
+  const td=today(), now=nowHM();
+  const due=rs.filter(r=>r.lastFired===td&&r.lastDone!==td);
+  const upcoming=rs.filter(r=>r.lastFired!==td);
+  let h='';
+  if(due.length){
+    h+=due.map(r=>`<div class="card due"><h2>Remember now</h2><div class="msg">${esc(r.title)}</div>${r.body?`<div>${esc(r.body)}</div>`:''}
+      <button class="go big" data-play="${r.id}">▶ Play${r.audio?' my voice':''}</button>
+      <button class="alt" data-done="${r.id}">✓ Done</button></div>`).join('');
+  }else if(upcoming.length){
+    const nx=upcoming.find(r=>r.time>now)||upcoming[0];
+    h=`<div class="card"><h2>Next up</h2><div class="msg">${esc(nx.title)}</div><span class="pill">${nx.time}</span><span class="note">Keep this page open to be alerted.</span></div>`;
+  }else if(rs.length){h='<div class="card"><h2>Today</h2>All done. Well kept.</div>'}
+  $('today').innerHTML=h;
+  $('list').innerHTML=rs.length?rs.map(r=>`<div style="padding:10px 0;border-top:1px solid var(--line)">
+    <strong>${esc(r.title)}</strong><br>
+    <span class="pill">${r.time} daily</span><span class="pill">${r.audio?'voice':r.speak?'read aloud':'text'}</span><span class="pill">played ${r.plays||0}×</span>
+    <div>${r.audio?'<button class="alt" data-play="'+r.id+'">▶ Replay</button>':r.speak?'<button class="alt" data-play="'+r.id+'">▶ Read aloud</button>':''}
+    <button class="alt" data-del="${r.id}">Delete</button></div></div>`).join(''):'<div class="empty">Nothing yet. Add your first reminder above.</div>';
+  document.querySelectorAll('[data-play]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.play);if(r)play(r)});
+  document.querySelectorAll('[data-done]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.done);if(r)done(r)});
+  document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{await del(b.dataset.del);render()});
+}
+
+openDB().then(()=>{render();tick();setInterval(tick,15000)});
+})();
+</script>
+</body>
+</html>
