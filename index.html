@@ -51,6 +51,11 @@ audio{width:100%;margin-top:8px}
   <p class="sub">Remembered your way. In your voice, your words, as often as you like.</p>
 
   <div id="armBox"></div>
+  <div class="card" id="pushCard" hidden>
+    <h2>Alerts when the app is closed</h2>
+    <div id="pushTxt" class="note"></div>
+    <button id="pushBtn" class="go" type="button" hidden>Turn on alerts</button>
+  </div>
   <div id="today"></div>
 
   <div class="card">
@@ -189,7 +194,7 @@ async function saveReminder(testIn1){
     const stored=await put(o);
     const back=(await all()).find(x=>x.id===o.id);
     if(!back)throw new Error('not found after save');
-    logEv(o,'created');
+    logEv(o,'created');syncPush();
     const when=o.lastFired?'tomorrow at '+fmt(time):'today at '+fmt(time);
     setMsg('Saved ✓ Your reminder will fire '+when+'. Keep this app open (or installed) at that time.'+(stored?'':' (Storage is unavailable here, so this lasts only until you close the page.)'),true);
   }catch(e){
@@ -268,6 +273,73 @@ async function checkStatus(){
     if(st&&st!=='sharing')dropConn(st==='stopped_by_clinician'?'Your clinician has stopped monitoring. Sharing is off.':'Sharing is off.')}catch(e){}
 }
 
+// ---------- push alerts (work with the app closed) ----------
+const IOS=/iphone|ipad|ipod/i.test(navigator.userAgent);
+const STANDALONE=(window.matchMedia&&matchMedia('(display-mode: standalone)').matches)||navigator.standalone;
+const PUSHOK=!!(CFG.url&&'serviceWorker' in navigator&&'PushManager' in window&&'Notification' in window);
+function devId(){try{let d=localStorage.getItem('ye-dev');if(!d){d=(crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random().toString(36).slice(2,12));localStorage.setItem('ye-dev',d)}return d}catch(e){return 'nodev-'+Math.random().toString(36).slice(2,12)}}
+const u8=b=>{const p='='.repeat((4-b.length%4)%4),r=atob((b+p).replace(/-/g,'+').replace(/_/g,'/'));return Uint8Array.from(r,c=>c.charCodeAt(0))};
+async function vapidKey(){
+  try{const c=localStorage.getItem('ye-vapid');if(c)return c}catch(e){}
+  const res=await fetch(CFG.url+'/functions/v1/push?action=key',{headers:{'apikey':CFG.key}});
+  const k=(await res.json()).key;if(!k)throw new Error('no key');
+  try{localStorage.setItem('ye-vapid',k)}catch(e){}return k;
+}
+const pushOn=()=>{try{return localStorage.getItem('ye-push')==='1'}catch(e){return false}};
+async function syncPush(){
+  if(!PUSHOK||!pushOn())return;
+  try{
+    const reg=await navigator.serviceWorker.ready;const sub=await reg.pushManager.getSubscription();
+    if(!sub){try{localStorage.removeItem('ye-push')}catch(e){}renderPush();return}
+    const items=(await all()).map(r=>({id:r.id,title:r.title,time:r.time,once:!!r.test,skipToday:r.lastFired===today()}));
+    const res=await rpc('sync_push',{p_device:devId(),p_sub:sub.toJSON(),p_tz:Intl.DateTimeFormat().resolvedOptions().timeZone,p_items:items});
+    if(!res.ok)throw new Error('sync '+res.status);
+    try{localStorage.removeItem('ye-pdirty')}catch(e){}
+  }catch(e){try{localStorage.setItem('ye-pdirty','1')}catch(_){}}
+}
+function ackPush(r){
+  if(!PUSHOK||!pushOn()||!r)return;
+  rpc('ack_push',{p_device:devId(),p_rid:r.id,p_date:today()}).catch(()=>{});
+}
+async function enablePush(){
+  const m=$('pushTxt');
+  try{
+    const perm=await Notification.requestPermission();
+    if(perm!=='granted'){m.textContent='Notifications are blocked. Allow notifications for this app in your phone settings, then tap the button again.';return}
+    const reg=await navigator.serviceWorker.ready;
+    let sub=await reg.pushManager.getSubscription();
+    if(!sub)sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:u8(await vapidKey())});
+    try{localStorage.setItem('ye-push','1')}catch(e){}
+    await syncPush();
+  }catch(e){m.textContent='Could not turn on alerts ('+(e&&e.name||'error')+'). Check your connection and try again.';return}
+  renderPush();
+}
+function renderPush(){
+  if(!CFG.url){return}
+  $('pushCard').hidden=false;const t=$('pushTxt'),b=$('pushBtn');
+  if(!PUSHOK){
+    b.hidden=true;
+    t.textContent=IOS&&!STANDALONE?'To get alerts on iPhone: tap Share, then "Add to Home Screen", then open the app from your home screen and turn alerts on here.':'This browser cannot send alerts when closed. Use Chrome on Android, or install to your home screen on iPhone.';
+    return;
+  }
+  if(pushOn()&&Notification.permission==='granted'){b.hidden=true;t.innerHTML='<strong style="color:var(--ok)">✓ Alerts are on.</strong> You will be notified at each reminder time, even when the app is closed, and nudged every 2 minutes until you tap Done.'}
+  else{b.hidden=false;t.textContent='Turn on alerts so your phone notifies you at reminder time even when the app is closed.'}
+}
+$('pushBtn').onclick=enablePush;
+window.addEventListener('online',()=>{if(localStorage.getItem('ye-pdirty'))syncPush()});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&PUSHOK&&pushOn())syncPush()});
+if('serviceWorker' in navigator)navigator.serviceWorker.addEventListener('message',async ev=>{
+  if(ev.data&&ev.data.type==='ring'){
+    const r=(await all()).find(x=>x.id===ev.data.id);
+    if(r&&!(ringing&&ringing.id===r.id)){r.lastFired=today();try{await put(r)}catch(e){}ring(r)}
+  }
+});
+async function openFromNotification(){
+  const id=new URLSearchParams(location.search).get('ring');if(!id)return;
+  const r=(await all()).find(x=>x.id===id);
+  if(r&&!(ringing&&ringing.id===r.id)){r.lastFired=today();try{await put(r)}catch(e){}ring(r)}
+}
+
 // ---------- ringing: loops until the person presses STOP ----------
 const player=new Audio();player.setAttribute('playsinline','');
 let armed=false,ringTest=false,ringing=null,wake=null,vibT=null,gapT=null;
@@ -289,10 +361,12 @@ function stopRing(markDone){
   try{speechSynthesis.cancel()}catch(e){}
   clearTimeout(gapT);clearInterval(vibT);try{navigator.vibrate&&navigator.vibrate(0)}catch(e){}
   $('ring').classList.remove('on');document.title='Ye Oldie Reminder';
-  if(r&&markDone){if(!ringTest)logEv(r,'done');r.lastDone=today();put(r).catch(()=>{}).then(render)}
+  if(r&&markDone){ackPush(r);if(!ringTest)logEv(r,'done');r.lastDone=today();put(r).catch(()=>{}).then(render)}
 }
 function ring(r,isTest){
+  if(ringing&&ringing.id===r.id&&!isTest)return;
   if(ringing)stopRing(false);
+  ackPush(r);
   ringing=r;ringTest=!!isTest;if(!isTest)logEv(r,'fired');r.plays=(r.plays||0)+1;put(r).catch(()=>{});
   $('ringT').textContent=r.title;$('ringB').textContent=r.body||'';$('ring').classList.add('on');
   document.title='🔔 '+r.title;
@@ -356,10 +430,10 @@ async function render(){
   document.querySelectorAll('[data-play]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.play);if(r)ring(r,true)});
   document.querySelectorAll('[data-done]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.done);if(r)done(r)});
   document.querySelectorAll('[data-test]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.test);if(r){r.lastDone='';r.lastFired=today();try{await put(r)}catch(e){}render();ring(r,true)}});
-  document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.del);logEv(r,'deleted');await del(b.dataset.del);render()});
+  document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{const r=(await all()).find(x=>x.id===b.dataset.del);logEv(r,'deleted');await del(b.dataset.del);syncPush();render()});
 }
 
-openDB().then(()=>{renderConnect();checkStatus().then(flushQ);renderArm();render();tick();setInterval(tick,5000)});
+openDB().then(()=>{renderPush();syncPush();openFromNotification();renderConnect();checkStatus().then(flushQ);renderArm();render();tick();setInterval(tick,5000)});
 })();
 </script>
 </body>

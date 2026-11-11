@@ -1,1 +1,1 @@
-window.YE_CFG={url:'',key:''};
+self.YE_CFG={url:'',key:''};
